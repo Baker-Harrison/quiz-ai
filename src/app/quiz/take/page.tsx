@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import type { Quiz } from "@/lib/quizSchema";
+import type { Quiz, Feedback } from "@/lib/quizSchema";
 
 export default function QuizTakePage() {
   const [quiz, setQuiz] = useState<Quiz | null>(null);
@@ -35,17 +35,32 @@ export default function QuizTakePage() {
     }
     setSubmitting(true);
     try {
+      const metaRaw = localStorage.getItem("quizMeta");
+      const meta = metaRaw
+        ? (JSON.parse(metaRaw) as { domain?: "pharmacy"; enforceQuality?: boolean; groupId?: number | null })
+        : {};
       const res = await fetch("/api/quiz/feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ quiz, answers }),
+        body: JSON.stringify({
+          quiz,
+          answers,
+          domain: meta.domain ?? "pharmacy",
+          enforceQuality: meta.enforceQuality ?? true,
+          groupId: typeof meta.groupId === "number" ? meta.groupId : undefined,
+        }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || "Failed to get feedback");
       }
-      const feedback = await res.json();
-      localStorage.setItem("feedbackData", JSON.stringify(feedback));
+      const data: { feedback: Feedback; attemptId: number | null } = await res.json();
+      localStorage.setItem("feedbackData", JSON.stringify(data.feedback));
+      if (typeof data.attemptId === "number") {
+        localStorage.setItem("latestAttemptId", String(data.attemptId));
+      } else {
+        localStorage.removeItem("latestAttemptId");
+      }
       router.push("/quiz/results");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Unknown error";
@@ -70,6 +85,7 @@ export default function QuizTakePage() {
         <nav className="text-sm flex gap-3">
           <Link className="underline" href="/">Home</Link>
           <Link className="underline" href="/quiz">Back</Link>
+          <Link className="underline" href="/quiz/history">History</Link>
         </nav>
       </header>
 

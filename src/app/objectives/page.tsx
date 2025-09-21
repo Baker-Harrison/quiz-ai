@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 
 type Objective = { id: number; text: string; createdAt: string };
+type Group = { id: number; name: string };
 
 export default function ObjectivesPage() {
   const [items, setItems] = useState<Objective[]>([]);
@@ -13,11 +14,69 @@ export default function ObjectivesPage() {
   const [bulkLoading, setBulkLoading] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editingText, setEditingText] = useState("");
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [groupId, setGroupId] = useState<number | null>(null);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
 
   const load = async () => {
-    const res = await fetch("/api/objectives");
-    const data = await res.json();
-    setItems(data);
+    try {
+      const qs = groupId ? `?groupId=${groupId}` : "";
+      const res = await fetch(`/api/objectives${qs}`);
+      if (!res.ok) {
+        // Attempt to read error body for debugging but do not break UI
+        try {
+          const err = await res.json();
+          console.error("Failed to load objectives:", err);
+        } catch {
+          // ignore
+        }
+        setItems([]);
+        return;
+      }
+      const data = await res.json();
+      setItems(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error("Error fetching objectives:", e);
+      setItems([]);
+    }
+  };
+
+  const createGroup = async () => {
+    if (!newGroupName.trim()) return;
+    setCreatingGroup(true);
+    try {
+      const res = await fetch("/api/groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newGroupName.trim() }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to create group");
+      }
+      const g: Group = await res.json();
+      setGroups((prev) => [...prev, g].sort((a, b) => a.name.localeCompare(b.name)));
+      setGroupId(g.id);
+      setNewGroupName("");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      alert(msg);
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
+
+  const loadGroups = async () => {
+    try {
+      const res = await fetch("/api/groups", { cache: "no-store" });
+      if (!res.ok) return;
+      const data: Group[] = await res.json();
+      setGroups(data);
+      if (!groupId && data.length > 0) setGroupId(data[0].id);
+    } catch {
+      // ignore
+    }
   };
 
   const bulkAdd = async () => {
@@ -26,12 +85,18 @@ export default function ObjectivesPage() {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
     if (parts.length === 0) return;
+    if (groupId === null) {
+      alert("Select a group before adding objectives.");
+      return;
+    }
     setBulkLoading(true);
     try {
+      const payload: { items: string[]; groupId?: number } = { items: parts };
+      if (groupId !== null) payload.groupId = groupId;
       const res = await fetch("/api/objectives/bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: parts }),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -48,23 +113,42 @@ export default function ObjectivesPage() {
   };
 
   useEffect(() => {
-    load();
+    (async () => {
+      await loadGroups();
+    })();
   }, []);
+
+  useEffect(() => {
+    if (groupId !== null) {
+      load();
+    }
+  }, [groupId]);
 
   const add = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!text.trim()) return;
+    if (groupId === null) {
+      alert("Select a group before adding objectives.");
+      return;
+    }
     setLoading(true);
     try {
+      const payload: { text: string; groupId?: number } = { text: text.trim() };
+      if (groupId !== null) payload.groupId = groupId;
       const res = await fetch("/api/objectives", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify(payload),
       });
-      if (res.ok) {
-        setText("");
-        await load();
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to add objective");
       }
+      setText("");
+      await load();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      alert(msg);
     } finally {
       setLoading(false);
     }
@@ -87,6 +171,13 @@ export default function ObjectivesPage() {
     await load();
   };
 
+  const deleteAll = async () => {
+    if (window.confirm("Are you sure you want to delete all objectives? This cannot be undone.")) {
+      await fetch(`/api/objectives`, { method: "DELETE" });
+      await load();
+    }
+  };
+
   const del = async (id: number) => {
     await fetch(`/api/objectives/${id}`, { method: "DELETE" });
     await load();
@@ -102,6 +193,35 @@ export default function ObjectivesPage() {
           <Link className="underline" href="/insights">Insights</Link>
         </nav>
       </header>
+
+      <section className="mb-4 flex flex-col sm:flex-row sm:items-end gap-3">
+        <div>
+          <label className="block text-sm font-medium mb-1">Group</label>
+          <select
+            value={groupId ?? undefined}
+            onChange={(e) => setGroupId(Number(e.target.value))}
+            className="border rounded px-3 py-2 min-w-48"
+          >
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-end gap-2">
+          <div>
+            <label className="block text-sm font-medium mb-1">New group</label>
+            <input
+              className="border rounded px-3 py-2"
+              placeholder="e.g., POPP 2"
+              value={newGroupName}
+              onChange={(e) => setNewGroupName(e.target.value)}
+            />
+          </div>
+          <button onClick={createGroup} disabled={creatingGroup || !newGroupName.trim()} className="border rounded px-3 py-2">
+            {creatingGroup ? "Creating..." : "Create Group"}
+          </button>
+        </div>
+      </section>
 
       <form onSubmit={add} className="flex gap-2 mb-6">
         <input
@@ -137,6 +257,12 @@ export default function ObjectivesPage() {
           </button>
         </div>
       </section>
+
+      {items.length > 0 && (
+        <div className="text-right mb-4">
+          <button onClick={deleteAll} className="px-3 py-2 rounded border text-red-600">Delete All</button>
+        </div>
+      )}
 
       <ul className="space-y-3">
         {items.map((obj) => (

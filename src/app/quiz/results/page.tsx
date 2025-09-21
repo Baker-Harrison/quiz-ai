@@ -7,15 +7,50 @@ import type { Quiz, Feedback } from "@/lib/quizSchema";
 export default function QuizResultsPage() {
   const [quiz, setQuiz] = useState<Quiz | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [attemptId, setAttemptId] = useState<number | null>(null);
+  const [meta, setMeta] = useState<{ domain: string; enforceQuality: boolean; groupId: number | null; groupName: string | null } | null>(null);
 
   useEffect(() => {
     const qRaw = localStorage.getItem("quizData");
     const fRaw = localStorage.getItem("feedbackData");
+    const attemptRaw = localStorage.getItem("latestAttemptId");
+    const metaRaw = localStorage.getItem("quizMeta");
     if (qRaw) setQuiz(JSON.parse(qRaw));
     if (fRaw) setFeedback(JSON.parse(fRaw));
+    if (attemptRaw) {
+      const parsed = Number(attemptRaw);
+      setAttemptId(Number.isFinite(parsed) ? parsed : null);
+    }
+    if (metaRaw) {
+      try {
+        const parsed = JSON.parse(metaRaw) as {
+          domain?: string;
+          enforceQuality?: boolean;
+          groupId?: number | null;
+          groupName?: string | null;
+        };
+        setMeta({
+          domain: parsed.domain ?? "pharmacy",
+          enforceQuality: parsed.enforceQuality ?? true,
+          groupId: typeof parsed.groupId === "number" ? parsed.groupId : null,
+          groupName: typeof parsed.groupName === "string" ? parsed.groupName : null,
+        });
+      } catch {
+        setMeta(null);
+      }
+    }
   }, []);
 
   const items = useMemo<Feedback["items"]>(() => feedback?.items ?? [], [feedback]);
+  const score = useMemo(() => {
+    if (!quiz) return null;
+    const correct = items.reduce((acc, item) => {
+      if (item.type === "mcq") return acc + (item.correct ? 1 : 0);
+      if (typeof item.correct === "boolean") return acc + (item.correct ? 1 : 0);
+      return acc;
+    }, 0);
+    return `${correct}/${quiz.questions.length}`;
+  }, [items, quiz]);
 
   if (!quiz || !feedback) {
     return (
@@ -32,8 +67,42 @@ export default function QuizResultsPage() {
         <nav className="text-sm flex gap-3">
           <Link className="underline" href="/">Home</Link>
           <Link className="underline" href="/quiz">New Quiz</Link>
+          <Link className="underline" href="/quiz/history">History</Link>
         </nav>
       </header>
+
+      <section className="mb-6 grid gap-4 sm:grid-cols-2">
+        {score && (
+          <div className="border rounded p-4">
+            <p className="text-sm text-gray-500 uppercase tracking-wide">Score</p>
+            <p className="text-xl font-semibold">{score}</p>
+          </div>
+        )}
+        {meta && (
+          <div className="border rounded p-4">
+            <p className="text-sm text-gray-500 uppercase tracking-wide">Domain</p>
+            <p className="text-xl font-semibold">{meta.domain}</p>
+            {!meta.enforceQuality && <p className="text-xs text-gray-500">Quality guidelines disabled</p>}
+          </div>
+        )}
+        {meta?.groupName && (
+          <div className="border rounded p-4">
+            <p className="text-sm text-gray-500 uppercase tracking-wide">Group</p>
+            <p className="text-xl font-semibold">{meta.groupName}</p>
+          </div>
+        )}
+        {attemptId && (
+          <div className="border rounded p-4 sm:col-span-2 flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-500 uppercase tracking-wide">Saved attempt</p>
+              <p className="text-sm text-gray-600">Attempt #{attemptId} stored in history.</p>
+            </div>
+            <Link className="underline" href={`/quiz/history/${attemptId}`}>
+              View details
+            </Link>
+          </div>
+        )}
+      </section>
 
       <ol className="space-y-6">
         {quiz.questions.map((q: Quiz["questions"][number], qi: number) => {

@@ -12,14 +12,48 @@ model Objective {
   text      String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  groupId   Int?
+  group     Group?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  @@unique([text, groupId])
 }
 
 model Insight {
   id          Int      @id @default(autoincrement())
-  key         String   @unique
+  key         String
   weakPoints  String
   strongPoints String
   studyPlan   String
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  groupId     Int?
+  group       Group?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  @@unique([key, groupId])
+}
+
+model Group {
+  id         Int         @id @default(autoincrement())
+  name       String      @unique
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  objectives Objective[]
+  insights   Insight[]
+  quizAttempts QuizAttempt[]
+  @@map("groups")
+}
+
+model QuizAttempt {
+  id             Int      @id @default(autoincrement())
+  quiz           String
+  answers        String
+  feedback       String
+  domain         String
+  enforceQuality Boolean
+  correctCount   Int
+  questionCount  Int
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  groupId        Int?
+  group          Group?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
 }

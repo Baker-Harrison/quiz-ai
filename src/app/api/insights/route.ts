@@ -8,6 +8,7 @@ const bodySchema = z.object({
   weakPoints: z.array(z.string()).optional().default([]),
   strongPoints: z.array(z.string()).optional().default([]),
   studyPlan: z.array(z.string()).optional().default([]),
+  groupId: z.number().int().optional(),
 });
 
 function mergeUnique(a: string[], b: string[], max = 200) {
@@ -24,9 +25,24 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
-export async function GET() {
+function parseGroupId(param: string | null): number | null {
+  if (param == null) return null;
+  const numeric = Number(param);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+export async function GET(req: NextRequest) {
   try {
-    const current = await prisma.insight.findUnique({ where: { key: "global" } });
+    const { searchParams } = new URL(req.url);
+    const groupIdParam = searchParams.get("groupId");
+    const groupId = parseGroupId(groupIdParam);
+    if (groupIdParam && groupId == null) {
+      return NextResponse.json({ error: "Invalid groupId" }, { status: 400 });
+    }
+
+    const current = groupId == null
+      ? await prisma.insight.findFirst({ where: { key: "global", groupId: null } })
+      : await prisma.insight.findUnique({ where: { key_groupId: { key: "global", groupId } } });
     if (!current) {
       return NextResponse.json({ weakPoints: [], strongPoints: [], studyPlan: [] });
     }
@@ -44,27 +60,45 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const data = bodySchema.parse(await req.json());
-    const current = await prisma.insight.findUnique({ where: { key: "global" } });
+    const normalizedGroupId = typeof data.groupId === "number" ? data.groupId : null;
+    const current = normalizedGroupId == null
+      ? await prisma.insight.findFirst({ where: { key: "global", groupId: null } })
+      : await prisma.insight.findUnique({ where: { key_groupId: { key: "global", groupId: normalizedGroupId } } });
 
-    const next = current
+    const merged = current
       ? {
           weakPoints: mergeUnique(parseJsonArray(current.weakPoints), data.weakPoints),
           strongPoints: mergeUnique(parseJsonArray(current.strongPoints), data.strongPoints),
           studyPlan: mergeUnique(parseJsonArray(current.studyPlan), data.studyPlan),
         }
-      : data;
+      : {
+          weakPoints: data.weakPoints,
+          strongPoints: data.strongPoints,
+          studyPlan: data.studyPlan,
+        };
 
-    const saved = await prisma.insight.upsert({
-      where: { key: "global" },
-      update: { weakPoints: JSON.stringify(next.weakPoints), strongPoints: JSON.stringify(next.strongPoints), studyPlan: JSON.stringify(next.studyPlan) },
-      create: { key: "global", weakPoints: JSON.stringify(next.weakPoints), strongPoints: JSON.stringify(next.strongPoints), studyPlan: JSON.stringify(next.studyPlan) },
-    });
+    if (current) {
+      await prisma.insight.update({
+        where: { id: current.id },
+        data: {
+          weakPoints: JSON.stringify(merged.weakPoints),
+          strongPoints: JSON.stringify(merged.strongPoints),
+          studyPlan: JSON.stringify(merged.studyPlan),
+        },
+      });
+    } else {
+      await prisma.insight.create({
+        data: {
+          key: "global",
+          weakPoints: JSON.stringify(merged.weakPoints),
+          strongPoints: JSON.stringify(merged.strongPoints),
+          studyPlan: JSON.stringify(merged.studyPlan),
+          groupId: normalizedGroupId ?? undefined,
+        },
+      });
+    }
 
-    return NextResponse.json({
-      weakPoints: parseJsonArray(saved.weakPoints),
-      strongPoints: parseJsonArray(saved.strongPoints),
-      studyPlan: parseJsonArray(saved.studyPlan),
-    });
+    return NextResponse.json(merged);
   } catch (e: unknown) {
     if (e instanceof ZodError) return NextResponse.json({ error: e.errors }, { status: 400 });
     const message = e instanceof Error ? e.message : "Failed to upsert insights";

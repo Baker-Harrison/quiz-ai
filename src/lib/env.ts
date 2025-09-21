@@ -1,9 +1,9 @@
 import { z } from "zod";
 
 const schema = z.object({
-  GEMINI_API_KEY: z.string().min(1, "GEMINI_API_KEY is required"),
+  GEMINI_API_KEY: z.string().optional(),
   GEMINI_MODEL: z.string().optional(),
-  DATABASE_URL: z.string().min(1).optional(),
+  DATABASE_URL: z.string().optional(),
 });
 
 export const env = schema.parse({

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z, ZodError } from "zod";
-import { geminiModel } from "@/lib/gemini";
+import { getGeminiModel } from "@/lib/gemini";
+import { env } from "@/lib/env";
 import prisma from "@/lib/prisma";
 import { feedbackSchema, quizSchema, Feedback } from "@/lib/quizSchema";
 
@@ -10,6 +11,9 @@ const reqSchema = z.object({
   quiz: quizSchema,
   // answers: for mcq -> number index; for short -> string with user's text
   answers: z.array(z.union([z.number().int(), z.string()])).min(1),
+  domain: z.enum(["pharmacy"]).optional(),
+  enforceQuality: z.boolean().optional().default(true),
+  groupId: z.number().int().optional(),
 });
 
 function extractJson(text: string): unknown {
@@ -22,9 +26,21 @@ function extractJson(text: string): unknown {
   }
 }
 
+function parseJsonArray(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  try {
+    const arr = JSON.parse(value);
+    return Array.isArray(arr) ? (arr.filter((x) => typeof x === "string") as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { quiz, answers } = reqSchema.parse(await req.json());
+    const { quiz, answers, domain, enforceQuality, groupId } = reqSchema.parse(await req.json());
+    const domainTag = domain ?? "pharmacy";
+    const normalizedGroupId = typeof groupId === "number" ? groupId : null;
     if (answers.length !== quiz.questions.length) {
       return NextResponse.json({ error: "Answers length mismatch" }, { status: 400 });
     }
@@ -67,7 +83,12 @@ export async function POST(req: NextRequest) {
     });
 
     // We compute correctness for MCQs here; AI provides feedback text only. For shorts, AI may include a correctness flag.
-    const prompt = `You are an expert tutor. For each item below, write constructive feedback. Do NOT contradict the provided correct answers for MCQs.
+    const qualitySpec = enforceQuality ? `Quality guidelines:\n- Use precise, standard terminology; avoid vague or underspecified wording.\n- Be concise and constructive; avoid ambiguous phrasing.\n- For MCQs, do not contradict the provided correctIndex; focus feedback on reasoning.\n- Provide actionable study tips (bullet-like) grounded in the objectives.\n` : "";
+
+    const domainSpec = domainTag === "pharmacy" ? `Domain constraints (pharmacy):\n- Align legal/regulatory comments with federal CSA/DEA and NABP standards; avoid state-specific claims unless explicitly requested.\n- Use correct medication safety terminology (e.g., 'wrong time error' refers to administration timing, not dispensing).\n` : "";
+
+    const prompt = `You are an expert tutor. For each item below, write constructive feedback.
+${qualitySpec}${domainSpec}
 Also summarize the learner's weak points and propose a concise, actionable study plan (bullet points) tailored to the objectives.
 Respond ONLY in JSON matching this schema (no markdown):
 {
@@ -83,8 +104,12 @@ Respond ONLY in JSON matching this schema (no markdown):
 }
 Items (JSON): ${JSON.stringify(payload)}`;
 
+    if (!env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: "Server is not configured with GEMINI_API_KEY. Add it to .env or .env.local and restart the dev server." }, { status: 500 });
+    }
+    const model = getGeminiModel();
     async function callAI(promptText: string) {
-      return geminiModel.generateContent({
+      return model.generateContent({
         contents: [{ role: "user", parts: [{ text: promptText }] }],
         generationConfig: { responseMimeType: "application/json" },
       });
@@ -105,35 +130,66 @@ Items (JSON): ${JSON.stringify(payload)}`;
     }
 
     // Normalize missing 'type' field by inferring from properties
-    if (raw && typeof raw === "object" && (raw as any).items && Array.isArray((raw as any).items)) {
-      (raw as any).items = (raw as any).items.map((it: any) => {
+    type RawWithItems = { items: unknown[] };
+    type ItemObj = Record<string, unknown>;
+    if (
+      raw &&
+      typeof raw === "object" &&
+      "items" in (raw as Record<string, unknown>) &&
+      Array.isArray((raw as RawWithItems).items)
+    ) {
+      const tmp = raw as RawWithItems;
+      tmp.items = tmp.items.map((it) => {
         if (!it || typeof it !== "object") return it;
-        if (!("type" in it)) {
-          if ("userIndex" in it && "correctIndex" in it) return { type: "mcq", ...it };
-          if ("userText" in it) return { type: "short", ...it };
+        const obj = it as ItemObj;
+        if (!("type" in obj)) {
+          if ("userIndex" in obj && "correctIndex" in obj) return { type: "mcq", ...obj } as ItemObj;
+          if ("userText" in obj) return { type: "short", ...obj } as ItemObj;
         }
-        return it;
+        return obj;
       });
     }
 
     const parsed: Feedback = feedbackSchema.parse(raw);
 
-    // Overwrite 'correct' for MCQ items based on provided indices to avoid AI mislabeling.
-    parsed.items = parsed.items.map((it) => {
-      if (it.type === "mcq") {
-        // find matching question
-        const q = quiz.questions.find((qq) => qq.id === it.questionId && qq.type === "mcq");
-        if (q && q.type === "mcq") {
-          return { ...it, correct: it.userIndex === q.correctIndex };
-        }
+    const normalizedItems: Feedback["items"] = quiz.questions.map((q, idx) => {
+      const existing = parsed.items.find((it) => it.questionId === q.id);
+      const answer = answers[idx];
+      if (q.type === "mcq") {
+        const existingMcq = existing && existing.type === "mcq" ? existing : null;
+        const rawIndex = typeof answer === "number" ? answer : Number(answer);
+        const userIndex = Number.isInteger(rawIndex) ? rawIndex : -1;
+        return {
+          type: "mcq",
+          questionId: q.id,
+          correctIndex: q.correctIndex,
+          userIndex,
+          correct: userIndex === q.correctIndex,
+          feedback: existingMcq?.feedback ?? "",
+        };
       }
-      return it;
+      const existingShort = existing && existing.type === "short" ? existing : null;
+      const userText = typeof answer === "string" ? answer : String(answer ?? "");
+      return {
+        type: "short",
+        questionId: q.id,
+        userText,
+        correct: typeof existingShort?.correct === "boolean" ? existingShort.correct : undefined,
+        feedback: existingShort?.feedback ?? "",
+      };
     });
+
+    const questionCount = quiz.questions.length;
+    const correctCount = normalizedItems.reduce((acc, item) => {
+      if (item.type === "mcq") return acc + (item.correct ? 1 : 0);
+      if (typeof item.correct === "boolean") return acc + (item.correct ? 1 : 0);
+      return acc;
+    }, 0);
 
     // Derive strong/weak from items to augment LLM weakPoints
     const derivedWeak: string[] = [];
     const derivedStrong: string[] = [];
-    for (const it of parsed.items) {
+    for (const it of normalizedItems) {
       const q = quiz.questions.find((qq) => qq.id === it.questionId);
       if (!q) continue;
       const label = q.prompt;
@@ -147,24 +203,68 @@ Items (JSON): ${JSON.stringify(payload)}`;
     const weakPoints = Array.from(new Set([...(parsed.weakPoints ?? []), ...derivedWeak])).slice(0, 200);
     const strongPoints = Array.from(new Set([...derivedStrong])).slice(0, 200);
     const studyPlan = parsed.studyPlan ?? [];
+    const responseFeedback: Feedback = {
+      ...parsed,
+      items: normalizedItems,
+      weakPoints,
+      studyPlan,
+    };
 
-    // Upsert into Prisma singleton insights row
-    const current = await prisma.insight.findUnique({ where: { key: "global" } });
+    // Upsert into Prisma singleton insights row (fields stored as JSON strings)
+    const current = normalizedGroupId == null
+      ? await prisma.insight.findFirst({ where: { key: "global", groupId: null } })
+      : await prisma.insight.findUnique({ where: { key_groupId: { key: "global", groupId: normalizedGroupId } } });
     const merged = current
       ? {
-          weakPoints: Array.from(new Set([...(current.weakPoints as string[] ?? []), ...weakPoints])).slice(0, 500),
-          strongPoints: Array.from(new Set([...(current.strongPoints as string[] ?? []), ...strongPoints])).slice(0, 500),
-          studyPlan: Array.from(new Set([...(current.studyPlan as string[] ?? []), ...studyPlan])).slice(0, 500),
+          weakPoints: Array.from(new Set([...parseJsonArray(current.weakPoints), ...weakPoints])).slice(0, 500),
+          strongPoints: Array.from(new Set([...parseJsonArray(current.strongPoints), ...strongPoints])).slice(0, 500),
+          studyPlan: Array.from(new Set([...parseJsonArray(current.studyPlan), ...studyPlan])).slice(0, 500),
         }
       : { weakPoints, strongPoints, studyPlan };
 
-    await prisma.insight.upsert({
-      where: { key: "global" },
-      update: merged,
-      create: { key: "global", ...merged },
-    });
+    if (current) {
+      await prisma.insight.update({
+        where: { id: current.id },
+        data: {
+          weakPoints: JSON.stringify(merged.weakPoints),
+          strongPoints: JSON.stringify(merged.strongPoints),
+          studyPlan: JSON.stringify(merged.studyPlan),
+        },
+      });
+    } else {
+      await prisma.insight.create({
+        data: {
+          key: "global",
+          weakPoints: JSON.stringify(merged.weakPoints),
+          strongPoints: JSON.stringify(merged.strongPoints),
+          studyPlan: JSON.stringify(merged.studyPlan),
+          groupId: normalizedGroupId ?? undefined,
+        },
+      });
+    }
 
-    return NextResponse.json({ ...parsed, weakPoints, studyPlan });
+    const storedAnswers = normalizedItems.map((item) => (item.type === "mcq" ? item.userIndex : item.userText));
+
+    let attemptId: number | null = null;
+    try {
+      const attempt = await prisma.quizAttempt.create({
+        data: {
+          quiz: JSON.stringify(quiz),
+          answers: JSON.stringify(storedAnswers),
+          feedback: JSON.stringify(responseFeedback),
+          domain: domainTag,
+          enforceQuality,
+          correctCount,
+          questionCount,
+          groupId: normalizedGroupId ?? undefined,
+        },
+      });
+      attemptId = attempt.id;
+    } catch (err) {
+      console.error("Failed to persist quiz attempt", err);
+    }
+
+    return NextResponse.json({ feedback: responseFeedback, attemptId, strongPoints, groupId: normalizedGroupId });
   } catch (e: unknown) {
     if (e instanceof ZodError) return NextResponse.json({ error: e.errors }, { status: 400 });
     const message = e instanceof Error ? e.message : "Failed to generate feedback";

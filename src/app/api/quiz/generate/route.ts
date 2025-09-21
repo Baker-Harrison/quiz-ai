@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z, ZodError } from "zod";
-import { geminiModel } from "@/lib/gemini";
+import { getGeminiModel } from "@/lib/gemini";
+import { env } from "@/lib/env";
 import { quizSchema, Quiz } from "@/lib/quizSchema";
 import prisma from "@/lib/prisma";
 
@@ -8,8 +9,13 @@ export const runtime = "nodejs";
 
 const bodySchema = z.object({
   objectives: z.array(z.string()).optional(),
+  objectiveIds: z.array(z.number().int()).optional(),
   mode: z.enum(["mcq", "short"]).optional().default("mcq"),
   count: z.number().int().min(1).max(100).optional().default(5),
+  domain: z.enum(["pharmacy"]).optional(),
+  enforceQuality: z.boolean().optional().default(true),
+  caseBasedMin: z.number().int().min(0).max(100).optional(),
+  groupId: z.number().int().optional(),
 });
 
 function extractJson(text: string): unknown {
@@ -25,13 +31,28 @@ function extractJson(text: string): unknown {
 
 export async function POST(req: NextRequest) {
   try {
-    const { objectives, mode, count } = bodySchema.parse(await req.json());
-    let objs: string[];
-    if (objectives && objectives.length > 0) {
+    const { objectives, objectiveIds, mode, count, domain, enforceQuality, caseBasedMin, groupId } = bodySchema.parse(await req.json());
+    const domainTag = domain ?? "pharmacy";
+    let objs: string[] = [];
+    if (objectiveIds && objectiveIds.length > 0) {
+      const rows = await prisma.objective.findMany({
+        where: { id: { in: objectiveIds } },
+        select: { id: true, text: true },
+      });
+      const byId = new Map(rows.map((r) => [r.id, r.text]));
+      objs = objectiveIds.map((id) => byId.get(id)).filter((t): t is string => typeof t === "string");
+      if (objs.length !== objectiveIds.length && objectives && objectives.length > 0) {
+        const trimmed = objectives.map((o) => o.trim()).filter((o) => o.length > 0);
+        if (trimmed.length > 0) objs = trimmed;
+      }
+    } else if (objectives && objectives.length > 0) {
       objs = objectives;
+    } else if (typeof groupId === "number") {
+      const rows = await prisma.objective.findMany({ where: { groupId }, orderBy: { createdAt: "asc" } });
+      objs = rows.map((r) => r.text);
     } else {
       const rows = await prisma.objective.findMany({ orderBy: { createdAt: "asc" } });
-      objs = rows.map((r: { text: string }) => r.text);
+      objs = rows.map((r) => r.text);
     }
 
     if (!objs.length) {
@@ -39,6 +60,26 @@ export async function POST(req: NextRequest) {
     }
 
     const baseHeader = `You are an expert teacher. Create exactly ${count} high-quality ${mode === "mcq" ? "multiple-choice" : "short-answer"} questions that assess the following learning objectives.`;
+
+    const caseMin = caseBasedMin ?? Math.max(1, Math.floor(count * 0.3));
+
+    const qualitySpec = enforceQuality ? `Quality guidelines:
+- Use precise, standard terminology; avoid vague or underspecified wording.
+- If you reference a framework or approach, name it explicitly in the stem.
+- Avoid redundancy: each question must target a distinct concept; no duplicates or near-duplicates.
+- Balance Bloom's levels across the set: aim for a mix of remember/understand, apply/analyze, and evaluate/create. Annotate each as bloomLevel.
+- Balance difficulty: include a mix across 1–5 (1-2 easy, 3 medium, 4-5 hard). Annotate each with difficulty.
+- Include at least ${caseMin} case-based items. For a case-based stem, describe a realistic scenario (e.g., patient context) and ensure a single best answer.
+- Ensure MCQs have four plausible, homogeneous distractors; no clues; one best answer; no 'All/None of the above'.
+- Ensure short-answer prompts ask for a specific term/process; provide a concise canonical answer and brief rubric.` : "";
+
+    const domainSpec = domainTag === "pharmacy" ? `Domain constraints (pharmacy):
+- Align with federal CSA/DEA and NABP standards; avoid state-specific rules unless explicitly requested.
+- Use correct safety and error terminology (e.g., 'wrong time error' relates to administration timing, not dispensing).
+- Do not assert that a 'serial number of the prescription' is universally required; ensure legal phrasing is accurate.
+- Suitable coverage: patient safety & medication errors; prescription validity & labeling; technology (CPOE, BCMA); drug information & EBM; CSA/DEA regulations; patient counseling; OTC; pharmacovigilance.
+- Order the set roughly: Safety & Errors → Prescription Validity & Labeling → Technology & Error Prevention → DI & EBM → CSA/DEA.
+` : "";
 
     const mcqSpec = `Item-writing rules for MCQs:
 - Align stem to a single learning objective; write the stem first
@@ -82,13 +123,19 @@ difficulty: number (1–5)`;
 
     const prompt = `${baseHeader}
 
+${qualitySpec}
+${domainSpec}
 ${mode === "mcq" ? mcqSpec : shortSpec}
 
 Learning objectives:\n${objs.map((o, i) => `${i + 1}. ${o}`).join("\n")}\n
 Return ONLY valid minified JSON in this exact schema (no markdown):\n${schemaOut}`;
 
+    if (!env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: "Server is not configured with GEMINI_API_KEY. Add it to .env or .env.local and restart the dev server." }, { status: 500 });
+    }
+    const model = getGeminiModel();
     async function callAI(promptText: string) {
-      return geminiModel.generateContent({
+      return model.generateContent({
         contents: [{ role: "user", parts: [{ text: promptText }] }],
         generationConfig: { responseMimeType: "application/json" },
       });
@@ -126,8 +173,23 @@ Return ONLY valid minified JSON in this exact schema (no markdown):\n${schemaOut
       return NextResponse.json({ error: "AI returned an unexpected shape", snippet }, { status: 502 });
     }
 
+    // Deduplicate by prompt text to reduce redundancy
+    function dedupeByPrompt<T extends { prompt: string }>(arr: T[]): T[] {
+      const seen = new Set<string>();
+      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      return arr.filter((item) => {
+        const key = norm(item.prompt);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    const uniqueArr = dedupeByPrompt(qArr as (AIQuestionMcqIn | AIQuestionShortIn)[]);
+    const limitedArr = uniqueArr.slice(0, count);
+
     const withIds: AIReturn = {
-      questions: qArr.map((q, idx) => {
+      questions: limitedArr.map((q, idx) => {
         const id = q.id ?? `q_${idx + 1}`;
         if (mode === "mcq") {
           const m = q as AIQuestionMcqIn;
